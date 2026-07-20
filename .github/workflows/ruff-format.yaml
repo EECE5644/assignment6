@@ -1,0 +1,44 @@
+name: Auto Format with Ruff
+
+on:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "**.py"
+      - "**.ipynb"
+      - "pyproject.toml"
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install ruff
+        uses: astral-sh/ruff-action@v4.1.0
+        with:
+          args: "--version"
+
+      - name: Run ruff format
+        run: ruff format .
+
+      - name: Run ruff check --fix
+        id: ruff_fix
+        continue-on-error: true
+        run: ruff check --fix .
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "style: auto-format with ruff"
+
+      - name: Fail job if ruff check had unfixable errors
+        if: steps.ruff_fix.outcome == 'failure'
+        run: |
+          echo "::error::ruff check --fix still has unresolved errors, please check the log above"
+          exit 1
