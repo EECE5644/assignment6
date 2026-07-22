@@ -1,4 +1,5 @@
 from collections.abc import Hashable, Mapping
+from pathlib import Path
 from typing import override
 
 import numpy as np
@@ -188,3 +189,153 @@ class SequenceDataset(Dataset):
 
 train_dataset = SequenceDataset(X_train, y_train)
 test_dataset = SequenceDataset(X_test, y_test)
+
+
+# ==================== Model ====================
+class LSTMForecaster(nn.Module):
+    def __init__(
+        self,
+        n_features: int,
+        hidden_size: int = 64,
+        horizon: int = HORIZON,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.lstm = nn.LSTM(n_features, hidden_size, batch_first=True)
+        self.drop = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, horizon)
+
+    @override
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, (h_n, c_n) = self.lstm(x)
+        output = h_n[-1]  # (batch, hidden_size)
+        output = self.drop(output)
+        return self.fc(output)  # (batch, HORIZON)
+
+
+# ==================== Training ====================
+
+DEVICE = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
+BATCH_SIZE = 64
+EPOCHS = 100
+PATIENCE = 5
+LEARNING_RATE = 1e-3
+
+criterion = nn.MSELoss()
+
+
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    epochs: int = EPOCHS,
+    patience: int = PATIENCE,
+    lr: float = LEARNING_RATE,
+):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    patience_counter = 0
+    best_loss, best_state = float("inf"), None
+
+    model.to(DEVICE)
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        for features, targets in train_loader:
+            features, targets = features.to(DEVICE), targets.to(DEVICE)
+            preds = model(features)
+            loss = criterion(preds, targets)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        train_loss /= len(train_loader)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for features, targets in val_loader:
+                features, targets = features.to(DEVICE), targets.to(DEVICE)
+                preds = model(features)
+                loss = criterion(preds, targets)
+                val_loss += loss.item()
+
+        val_loss /= len(val_loader)
+
+        if epoch % 5 == 0:
+            print(
+                f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
+            )
+
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+
+CHECKPOINT_PATH = Path("checkpoints/lstm_forecaster.pt")
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+model = LSTMForecaster(n_features=len(FEATURE_COLS)).to(DEVICE)
+
+if CHECKPOINT_PATH.exists():
+    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+else:
+    train_model(model, train_loader, test_loader)
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), CHECKPOINT_PATH)
+
+
+# ==================== Evaluation ====================
+def evaluate_model(model: nn.Module, dataloader: DataLoader) -> tuple[float, float]:
+    total_loss = 0.0
+    total_ape, n_sample = 0.0, 0
+
+    model.eval()
+    with torch.no_grad():
+        for features, targets in dataloader:
+            features, targets = features.to(DEVICE), targets.to(DEVICE)
+            preds = model(features)
+            loss = criterion(preds, targets)
+            total_loss += loss.item()
+
+            preds_real = preds.cpu().numpy() * (target_max - target_min) + target_min
+            targets_real = (
+                targets.cpu().numpy() * (target_max - target_min) + target_min
+            )
+            total_ape += np.abs((targets_real - preds_real) / targets_real).sum()
+            n_sample += targets_real.size
+
+    total_loss /= len(dataloader)
+    mape = total_ape / n_sample
+    model.train()
+
+    return total_loss, mape
+
+
+train_loss, train_mape = evaluate_model(model, train_loader)
+print(f"Train MSE (scaled): {train_loss:.5f}, Train MAPE: {train_mape:.2%}")
+test_loss, test_mape = evaluate_model(model, test_loader)
+print(f"Test MSE (scaled): {test_loss:.5f}, Test MAPE: {test_mape:.2%}")
+
+
+# OUTPUT: [TODO]
+# Train MSE (scaled): 0.01184, Train MAPE: 73.42%
+# Test MSE (scaled): 0.00767, Test MAPE: 60.81%
