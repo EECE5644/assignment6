@@ -1,11 +1,17 @@
+from collections.abc import Hashable, Mapping
+from typing import override
+
+import numpy as np
 import pandas as pd
 
-
-DATA_PATH = r"./datasets/household_power_consumption.txt"
-LONG_GAP_MINUTES = 60  # gaps longer than this get filled from the same time last week
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
 
 
 # ==================== Load Data ====================
+
+DATA_PATH = r"./datasets/household_power_consumption.txt"
 
 data = pd.read_csv(DATA_PATH, sep=";", na_values=["?"])
 data = data.convert_dtypes()
@@ -29,6 +35,7 @@ data_raw = data.copy()  # keep the pre-imputation version around for sanity-chec
 
 
 # ==================== Train/Test Split ====================
+
 # Hold out the last six months as the test set; split before imputing missing values to avoid data leakage
 split_date = data.index.max() - pd.DateOffset(months=6)
 
@@ -37,6 +44,8 @@ test_data = data[data.index > split_date].copy()
 
 
 # ==================== Handle Missing Values ====================
+
+LONG_GAP_MINUTES = 60  # gaps longer than this get filled from the same time last week
 
 
 def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
@@ -68,20 +77,20 @@ data = pd.concat([train_data, test_data])
 
 # ==================== Resample to Hourly ====================
 
-data_hourly = data.resample("h").agg(
-    {
-        "Global_active_power": "mean",
-        "Global_reactive_power": "mean",
-        "Voltage": "mean",
-        "Global_intensity": "mean",
-        "Sub_metering_1": "sum",
-        "Sub_metering_2": "sum",
-        "Sub_metering_3": "sum",
-    }
-)
-data_hourly["Peak_active_power"] = data["Global_active_power"].resample("h").max()
+HOURLY_AGG: Mapping[Hashable, str] = {
+    "Global_active_power": "mean",
+    "Global_reactive_power": "mean",
+    "Voltage": "mean",
+    "Global_intensity": "mean",
+    "Sub_metering_1": "sum",
+    "Sub_metering_2": "sum",
+    "Sub_metering_3": "sum",
+}
 
-# print(hourly.head())
+# data_hourly = data.resample("h").agg(HOURLY_AGG)
+# data_hourly["Peak_active_power"] = data["Global_active_power"].resample("h").max()
+#
+# print(data_hourly.head())
 
 # ---------- Sanity-check visualization (before/after around a known outage)
 # window = slice("2007-04-25", "2007-05-02")   # covers the big April 2007 gap
@@ -90,3 +99,61 @@ data_hourly["Peak_active_power"] = data["Global_active_power"].resample("h").max
 # data["Global_active_power"][window].plot(ax=ax[1], title="Imputed")
 # plt.tight_layout()
 # plt.show()
+
+train_data, test_data = (
+    train_data.resample("h").agg(HOURLY_AGG),
+    test_data.resample("h").agg(HOURLY_AGG),
+)
+
+
+# ==================== Feature Engineering ====================
+
+# 7 days of history to predict the next 24 hours
+LOOKBACK = 24 * 7
+HORIZON = 24
+
+TARGET_COL = "Global_active_power"
+CALENDAR_COLS = [
+    "hour_sin",
+    "hour_cos",
+    "dayofweek_sin",
+    "dayofweek_cos",
+    "month_sin",
+    "month_cos",
+]
+FEATURE_COLS = [TARGET_COL, *CALENDAR_COLS]
+
+
+# Adds calendar features to the DataFrame including sin and cos transformations for hour, day of week, and month
+def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    assert isinstance(df.index, pd.DatetimeIndex)
+    hour, dayofweek, month = df.index.hour, df.index.dayofweek, df.index.month
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    df["dayofweek_sin"] = np.sin(2 * np.pi * dayofweek / 7)
+    df["dayofweek_cos"] = np.cos(2 * np.pi * dayofweek / 7)
+    df["month_sin"] = np.sin(2 * np.pi * (month - 1) / 12)
+    df["month_cos"] = np.cos(2 * np.pi * (month - 1) / 12)
+    return df
+
+
+train_data, test_data = (
+    add_calendar_features(train_data),
+    add_calendar_features(test_data),
+)
+
+
+# ---------- Feature Scaling
+target_min = train_data[TARGET_COL].min()
+target_max = train_data[TARGET_COL].max()
+
+
+def min_max_scale(series: pd.Series) -> pd.Series:
+    return (series - target_min) / (target_max - target_min)
+
+
+train_data[TARGET_COL] = min_max_scale(train_data[TARGET_COL])
+test_data[TARGET_COL] = min_max_scale(test_data[TARGET_COL])
+
+
+
