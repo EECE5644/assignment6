@@ -27,6 +27,7 @@ dev = [
 
 [tool.ruff]
 indent-width = 4
+line-length = 88
 
 
 [tool.ruff.lint.per-file-ignores]

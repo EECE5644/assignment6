@@ -1,8 +1,12 @@
 from collections.abc import Hashable, Mapping
+from typing import override
 
 import numpy as np
 import pandas as pd
 
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
 
 
 # ==================== Load Data ====================
@@ -104,10 +108,6 @@ train_data, test_data = (
 
 # ==================== Feature Engineering ====================
 
-# 7 days of history to predict the next 24 hours
-LOOKBACK = 24 * 7
-HORIZON = 24
-
 TARGET_COL = "Global_active_power"
 CALENDAR_COLS = [
     "hour_sin",
@@ -150,3 +150,41 @@ def min_max_scale(series: pd.Series) -> pd.Series:
 
 train_data[TARGET_COL] = min_max_scale(train_data[TARGET_COL])
 test_data[TARGET_COL] = min_max_scale(test_data[TARGET_COL])
+
+
+# ==================== Dataset Preparation ====================
+
+# 7 days of history to predict the next 24 hours
+LOOKBACK = 24 * 7
+HORIZON = 24
+
+TARGET_IDX = FEATURE_COLS.index(TARGET_COL)
+
+
+def make_sequences(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    X, y = [], []
+    for i in range(len(values) - LOOKBACK - HORIZON + 1):
+        X.append(values[i : i + LOOKBACK])
+        y.append(values[i + LOOKBACK : i + LOOKBACK + HORIZON, TARGET_IDX])
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+
+X_train, y_train = make_sequences(train_data[FEATURE_COLS].to_numpy())
+X_test, y_test = make_sequences(test_data[FEATURE_COLS].to_numpy())
+
+
+class SequenceDataset(Dataset):
+    def __init__(self, features: np.ndarray, targets: np.ndarray) -> None:
+        self.features = torch.from_numpy(features)
+        self.targets = torch.from_numpy(targets)
+
+    def __len__(self) -> int:
+        return len(self.features)
+
+    @override
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.features[idx], self.targets[idx]
+
+
+train_dataset = SequenceDataset(X_train, y_train)
+test_dataset = SequenceDataset(X_test, y_test)
