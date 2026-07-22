@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 
 # ==================== Load Data ====================
@@ -243,7 +244,8 @@ def train_model(
     best_loss, best_state = float("inf"), None
 
     model.to(DEVICE)
-    for epoch in range(epochs):
+    progress = tqdm(range(epochs), desc="Training", unit="epoch")
+    for epoch in progress:
         model.train()
         train_loss = 0.0
         for features, targets in train_loader:
@@ -270,10 +272,7 @@ def train_model(
 
         val_loss /= len(val_loader)
 
-        if epoch % 5 == 0:
-            print(
-                f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
-            )
+        progress.set_postfix(train_loss=f"{train_loss:.4f}", val_loss=f"{val_loss:.4f}")
 
         if val_loss < best_loss:
             best_loss = val_loss
@@ -282,7 +281,7 @@ def train_model(
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch}")
+                progress.write(f"Early stopping at epoch {epoch}")
                 break
 
     if best_state is not None:
