@@ -1,12 +1,8 @@
 from collections.abc import Hashable, Mapping
-from typing import override
 
 import numpy as np
 import pandas as pd
 
-import torch
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
 
 
 # ==================== Load Data ====================
@@ -154,6 +150,3 @@ def min_max_scale(series: pd.Series) -> pd.Series:
 
 train_data[TARGET_COL] = min_max_scale(train_data[TARGET_COL])
 test_data[TARGET_COL] = min_max_scale(test_data[TARGET_COL])
-
-
-
