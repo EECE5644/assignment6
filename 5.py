@@ -12,11 +12,11 @@ alert_indices = []
 count = 0
 for i, flag in enumerate(anomalies):
     if flag:
-      count += 1
-      if count >= 2:
-        alert_indices.append(i)
+        count += 1
+        if count >= 2:
+            alert_indices.append(i)
     else:
-      count = 0
+        count = 0
 
 print("Residuals:", residuals)
 print("Threshold:", threshold)
