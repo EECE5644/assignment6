@@ -1,3 +1,4 @@
+import time
 from collections.abc import Hashable, Mapping
 from pathlib import Path
 from typing import override
@@ -9,6 +10,14 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+
+# ==================== Reproducibility ====================
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 
 
 # ==================== Load Data ====================
@@ -28,28 +37,42 @@ assert data.index.is_monotonic_increasing
 data_raw = data.copy()  # keep the pre-imputation version around for sanity-check plots
 
 
-# ---------- Check Data
-# data.info()
-# print(data.head())
+# ---------- Identify missing values and outage structure
+LONG_GAP_MINUTES = 60  # gaps longer than this get filled from the same time last week
 
-# missing_count = data.isna().sum()
-# print(missing_count)
+# The dataset drops all sensors at once during a meter outage, so every column is
+# missing on the same rows; checking one column tells us about the whole row.
+_is_missing = data["Global_active_power"].isna()
+_gap_id = (_is_missing != _is_missing.shift()).cumsum()
+_gap_lengths = _is_missing.groupby(_gap_id).sum().astype(int)
+_gap_lengths = _gap_lengths[_gap_lengths > 0]
+
+print(f"Missing rows: {_is_missing.sum()} / {len(data)} ({_is_missing.mean():.2%})")
+print(f"Number of separate outages: {len(_gap_lengths)}")
+print(
+    f"Outage length (minutes) - min:{_gap_lengths.min()}, median:{_gap_lengths.median():.0f},",
+    f"max:{_gap_lengths.max()}(~{_gap_lengths.max() / 60:.1f}hours)",
+)
+print(
+    f"Outages longer than {LONG_GAP_MINUTES} min: {(_gap_lengths > LONG_GAP_MINUTES).sum()}",
+    f"out of {len(_gap_lengths)} - these are the multi-hour/multi-day outages that a flat",
+    "fill or short-window interpolation would visibly distort",
+)
+print(f"\n{'=' * 80}\n")
 
 
-# ==================== Train/Test Split ====================
+# ==================== Train/Val/Test Split ====================
 
-# Hold out the last six months as the test set; split before imputing missing values to avoid data leakage
-split_date = data.index.max() - pd.DateOffset(months=6)
+# Hold out the last six months as the test set, and 3 months before that as validation
+test_split_date = data.index.max() - pd.DateOffset(months=6)
+val_split_date = test_split_date - pd.DateOffset(months=3)
 
-train_data = data[data.index <= split_date].copy()
-test_data = data[data.index > split_date].copy()
+train_data = data[data.index <= val_split_date].copy()
+val_data = data[(data.index > val_split_date) & (data.index <= test_split_date)].copy()
+test_data = data[data.index > test_split_date].copy()
 
 
 # ==================== Handle Missing Values ====================
-
-LONG_GAP_MINUTES = 60  # gaps longer than this get filled from the same time last week
-
-
 def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
     value_cols = df.columns.tolist()
 
@@ -72,13 +95,19 @@ def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
 
 
 train_data = fill_missing(train_data)
+val_data = fill_missing(val_data)
 test_data = fill_missing(test_data)
 
-data = pd.concat([train_data, test_data])
+data = pd.concat([train_data, val_data, test_data])
 
 
 # ==================== Resample to Hourly ====================
 
+# Global_active_power/reactive_power/Voltage/Global_intensity are instantaneous
+# rates (1-minute averages), so the hourly value that keeps the same meaning is
+# the mean over that hour. Sub_metering_1/2/3 are energy already measured in
+# Wh per minute - a "quantity", not a rate - so they should be summed to get the
+# hour's total Wh, not averaged.
 HOURLY_AGG: Mapping[Hashable, str] = {
     "Global_active_power": "mean",
     "Global_reactive_power": "mean",
@@ -89,21 +118,16 @@ HOURLY_AGG: Mapping[Hashable, str] = {
     "Sub_metering_3": "sum",
 }
 
-# data_hourly = data.resample("h").agg(HOURLY_AGG)
-# data_hourly["Peak_active_power"] = data["Global_active_power"].resample("h").max()
-#
-# print(data_hourly.head())
+data_hourly = data.resample("h").agg(HOURLY_AGG)
+data_hourly["Peak_active_power"] = data["Global_active_power"].resample("h").max()
 
-# ---------- Sanity-check visualization (before/after around a known outage)
-# window = slice("2007-04-25", "2007-05-02")   # covers the big April 2007 gap
-# fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
-# data_raw["Global_active_power"][window].plot(ax=ax[0], title="Raw (with gap)")
-# data["Global_active_power"][window].plot(ax=ax[1], title="Imputed")
-# plt.tight_layout()
-# plt.show()
+print(f"Resampled {len(data)} minute-level rows into {len(data_hourly)} hourly rows")
+print(data_hourly.head())
+print(f"\n{'=' * 80}\n")
 
-train_data, test_data = (
+train_data, val_data, test_data = (
     train_data.resample("h").agg(HOURLY_AGG),
+    val_data.resample("h").agg(HOURLY_AGG),
     test_data.resample("h").agg(HOURLY_AGG),
 )
 
@@ -135,8 +159,9 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-train_data, test_data = (
+train_data, val_data, test_data = (
     add_calendar_features(train_data),
+    add_calendar_features(val_data),
     add_calendar_features(test_data),
 )
 
@@ -151,6 +176,7 @@ def min_max_scale(series: pd.Series) -> pd.Series:
 
 
 train_data[TARGET_COL] = min_max_scale(train_data[TARGET_COL])
+val_data[TARGET_COL] = min_max_scale(val_data[TARGET_COL])
 test_data[TARGET_COL] = min_max_scale(test_data[TARGET_COL])
 
 
@@ -172,6 +198,7 @@ def make_sequences(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 X_train, y_train = make_sequences(train_data[FEATURE_COLS].to_numpy())
+X_val, y_val = make_sequences(val_data[FEATURE_COLS].to_numpy())
 X_test, y_test = make_sequences(test_data[FEATURE_COLS].to_numpy())
 
 
@@ -189,6 +216,7 @@ class SequenceDataset(Dataset):
 
 
 train_dataset = SequenceDataset(X_train, y_train)
+val_dataset = SequenceDataset(X_val, y_val)
 test_dataset = SequenceDataset(X_test, y_test)
 
 
@@ -198,18 +226,25 @@ class LSTMForecaster(nn.Module):
         self,
         n_features: int,
         hidden_size: int = 64,
+        num_layers: int = 1,
         horizon: int = HORIZON,
         dropout: float = 0.2,
     ):
         super().__init__()
-        self.lstm = nn.LSTM(n_features, hidden_size, batch_first=True)
+        self.lstm = nn.LSTM(
+            n_features,
+            hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
         self.drop = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_size, horizon)
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, (h_n, c_n) = self.lstm(x)
-        output = h_n[-1]  # (batch, hidden_size)
+        output = h_n[-1]  # last layer's final hidden state, (batch, hidden_size)
         output = self.drop(output)
         return self.fc(output)  # (batch, HORIZON)
 
@@ -225,7 +260,7 @@ DEVICE = torch.device(
 )
 BATCH_SIZE = 64
 EPOCHS = 100
-PATIENCE = 5
+PATIENCE = 10
 LEARNING_RATE = 1e-3
 
 criterion = nn.MSELoss()
@@ -291,13 +326,14 @@ def train_model(
 CHECKPOINT_PATH = Path("checkpoints/lstm_forecaster.pt")
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 model = LSTMForecaster(n_features=len(FEATURE_COLS)).to(DEVICE)
 
 if CHECKPOINT_PATH.exists():
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
 else:
-    train_model(model, train_loader, test_loader)
+    train_model(model, train_loader, val_loader)
     CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), CHECKPOINT_PATH)
 
@@ -324,17 +360,92 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader) -> tuple[float, flo
 
     total_loss /= len(dataloader)
     mape = total_ape / n_sample
-    model.train()
 
     return total_loss, mape
 
 
 train_loss, train_mape = evaluate_model(model, train_loader)
 print(f"Train MSE (scaled): {train_loss:.5f}, Train MAPE: {train_mape:.2%}")
+val_loss, val_mape = evaluate_model(model, val_loader)
+print(f"Val MSE (scaled): {val_loss:.5f}, Val MAPE: {val_mape:.2%}")
 test_loss, test_mape = evaluate_model(model, test_loader)
 print(f"Test MSE (scaled): {test_loss:.5f}, Test MAPE: {test_mape:.2%}")
+print(f"\n{'=' * 80}\n")
 
 
-# OUTPUT: [TODO]
-# Train MSE (scaled): 0.01184, Train MAPE: 73.42%
-# Test MSE (scaled): 0.00767, Test MAPE: 60.81%
+# ==================== Deployment Considerations ====================
+
+# ---------- Inference Latency
+LATENCY_BUDGET_MS = 500.0
+
+model.eval()
+with torch.no_grad():
+    # Warm-up call so the timed runs don't include one-off kernel init overhead.
+    _ = model(test_dataset.features[:1].to(DEVICE))
+
+    start = time.perf_counter()
+    _ = model(test_dataset.features[:1].to(DEVICE))
+    single_latency_ms = (time.perf_counter() - start) * 1000
+
+    batch_size = min(1000, len(test_dataset))
+    batch = test_dataset.features[:batch_size].to(DEVICE)
+    start = time.perf_counter()
+    _ = model(batch)
+    batch_latency_ms = (time.perf_counter() - start) * 1000
+
+print(f"Single-household latency: {single_latency_ms:.2f} ms ")
+print(f"Batch of {batch_size} households: {batch_latency_ms:.2f} ms total", f"{batch_latency_ms / batch_size:.3f} ms/household")
+print(f"\n{'=' * 80}\n")
+
+
+# ---------- Anomaly Alerting
+# Flag a household when the 1-hour-ahead forecast error exceeds 3 std of the
+# historical (validation-set) residuals for 2+ consecutive hours.
+ANOMALY_STD_MULTIPLIER = 3.0
+MIN_CONSECUTIVE_HOURS = 2
+
+
+def one_step_residuals(model: nn.Module, dataloader: DataLoader) -> np.ndarray:
+    # Each window's first predicted hour is the model's 1-hour-ahead forecast,
+    # made 24 hours before the next window makes the same-hour forecast again.
+    model.eval()
+    residuals = []
+    with torch.no_grad():
+        for features, targets in dataloader:
+            features, targets = features.to(DEVICE), targets.to(DEVICE)
+            preds = model(features)
+            preds_real = (
+                preds[:, 0].cpu().numpy() * (target_max - target_min) + target_min
+            )
+            targets_real = (
+                targets[:, 0].cpu().numpy() * (target_max - target_min) + target_min
+            )
+            residuals.append(targets_real - preds_real)
+    return np.concatenate(residuals)
+
+
+val_residuals = one_step_residuals(model, val_loader)
+residual_std = val_residuals.std()
+alert_threshold = ANOMALY_STD_MULTIPLIER * residual_std
+
+test_residuals = one_step_residuals(model, test_loader)
+breach = np.abs(test_residuals) > alert_threshold
+
+# True at hour i only once `breach` has held for MIN_CONSECUTIVE_HOURS in a row.
+alert = np.zeros(len(breach), dtype=bool)
+consecutive = 0
+for i, is_breach in enumerate(breach):
+    consecutive = consecutive + 1 if is_breach else 0
+    if consecutive >= MIN_CONSECUTIVE_HOURS:
+        alert[i] = True
+
+n_alerts = int(alert.sum())
+false_alarm_rate = n_alerts / len(test_residuals)
+
+print(f"Residual std (val, 1h-ahead): {residual_std:.4f} kW")
+print(f"Alert threshold (±{ANOMALY_STD_MULTIPLIER:.0f}σ): {alert_threshold:.4f} kW")
+print(
+    f"Test hours flagged ({MIN_CONSECUTIVE_HOURS}+ consecutive breaches):",
+    f"{n_alerts} / {len(test_residuals)}",
+    f"({false_alarm_rate:.2%})"
+)
