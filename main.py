@@ -394,7 +394,10 @@ with torch.no_grad():
     batch_latency_ms = (time.perf_counter() - start) * 1000
 
 print(f"Single-household latency: {single_latency_ms:.2f} ms ")
-print(f"Batch of {batch_size} households: {batch_latency_ms:.2f} ms total", f"{batch_latency_ms / batch_size:.3f} ms/household")
+print(
+    f"Batch of {batch_size} households: {batch_latency_ms:.2f} ms total",
+    f"{batch_latency_ms / batch_size:.3f} ms/household",
+)
 print(f"\n{'=' * 80}\n")
 
 
@@ -447,5 +450,5 @@ print(f"Alert threshold (±{ANOMALY_STD_MULTIPLIER:.0f}σ): {alert_threshold:.4f
 print(
     f"Test hours flagged ({MIN_CONSECUTIVE_HOURS}+ consecutive breaches):",
     f"{n_alerts} / {len(test_residuals)}",
-    f"({false_alarm_rate:.2%})"
+    f"({false_alarm_rate:.2%})",
 )
