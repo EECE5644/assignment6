@@ -1,3 +1,4 @@
+import random
 import time
 from collections.abc import Hashable, Mapping
 from pathlib import Path
@@ -9,12 +10,14 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
 from tqdm import tqdm
 
 
 # ==================== Reproducibility ====================
 
 SEED = 42
+random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
